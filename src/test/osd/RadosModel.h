@@ -827,7 +827,13 @@ public:
     waiting_on++;
     write_op.setxattr("_header", contbl);
     if (!do_append) {
-      write_op.truncate(cont_gen->get_length(cont));
+      // randomly send truncate or 0 length write
+      if (rand() % 2) {
+	write_op.truncate(cont_gen->get_length(cont));
+      } else {
+	bufferlist bl;
+	write_op.write(cont_gen->get_length(cont), bl);
+      }
     }
     context->io_ctx.aio_operate(
       context->prefix+oid, completion, &write_op);

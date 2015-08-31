@@ -1799,6 +1799,11 @@ int buffer::list::write_file(const char *fn, int mode)
 
 int buffer::list::write_fd(int fd) const
 {
+  if (length() == 0) {
+    char buf[0];
+    return safe_write(fd, buf, 0);
+  }
+
   if (can_zero_copy())
     return write_fd_zero_copy(fd);
 

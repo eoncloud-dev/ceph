@@ -4699,6 +4699,7 @@ ostream &ObjectRecoveryInfo::print(ostream &out) const
 {
   return out << "ObjectRecoveryInfo("
 	     << soid << "@" << version
+	     << ", size: " << size
 	     << ", copy_subset: " << copy_subset
 	     << ", clone_subset: " << clone_subset
 	     << ")";

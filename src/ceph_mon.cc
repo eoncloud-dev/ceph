@@ -213,6 +213,8 @@ int main(int argc, const char **argv)
   argv_to_vec(argc, argv, args);
   env_to_vec(args);
 
+  dout(0) << "Welcome to EonStor! " << dendl;
+
   // We need to specify some default values that may be overridden by the
   // user, that are specific to the monitor.  The options we are overriding
   // are also used on the OSD (or in any other component that uses leveldb),

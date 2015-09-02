@@ -112,7 +112,7 @@ void ReplicatedPG::OpContext::start_async_reads(ReplicatedPG *pg)
   pg->pgbackend->objects_read_async(
     obc->obs.oi.soid,
     pending_async_reads,
-    new OnReadComplete(pg, this));
+    new OnReadComplete(pg, this), pg->get_pool().fast_read);
   pending_async_reads.clear();
 }
 void ReplicatedPG::OpContext::finish_read(ReplicatedPG *pg)
@@ -3651,13 +3651,52 @@ static int check_offset_and_length(uint64_t offset, uint64_t length, uint64_t ma
   return 0;
 }
 
-struct FillInExtent : public Context {
+struct FillInVerifyExtent : public Context {
   ceph_le64 *r;
-  FillInExtent(ceph_le64 *r) : r(r) {}
-  void finish(int _r) {
-    if (_r >= 0) {
-      *r = _r;
+  int32_t *rval;
+  bufferlist *outdatap;
+  boost::optional<uint32_t> maybe_crc;
+  uint64_t size;
+  OSDService *osd;
+  hobject_t soid;
+  __le32 flags;
+  FillInVerifyExtent(ceph_le64 *r, int32_t *rv, bufferlist *blp,
+		     boost::optional<uint32_t> mc, uint64_t size,
+		     OSDService *osd, hobject_t soid, __le32 flags) :
+    r(r), rval(rv), outdatap(blp), maybe_crc(mc),
+    size(size), osd(osd), soid(soid), flags(flags) {}
+  void finish(int len) {
+    *rval = len;
+    *r = len;
+    // whole object?  can we verify the checksum?
+    if (maybe_crc && *r == size) {
+      uint32_t crc = outdatap->crc32c(-1);
+      if (maybe_crc != crc) {
+        osd->clog->error() << std::hex << " full-object read crc 0x" << crc
+			   << " != expected 0x" << *maybe_crc
+			   << std::dec << " on " << soid << "\n";
+        if (!(flags & CEPH_OSD_OP_FLAG_FAILOK)) {
+	  *rval = -EIO;
+	  *r = 0;
+	}
+      }
     }
+  }
+};
+
+struct ToSparseReadResult : public Context {
+  bufferlist& data_bl;
+  ceph_le64& len;
+  ToSparseReadResult(bufferlist& bl, ceph_le64& len):
+    data_bl(bl), len(len) {}
+  void finish(int r) {
+    if (r < 0) return;
+    len = r;
+    bufferlist outdata;
+    map<uint64_t, uint64_t> extents = {{0, r}};
+    ::encode(extents, outdata);
+    ::encode_destructively(data_bl, outdata);
+    data_bl.swap(outdata);
   }
 };
 
@@ -3812,15 +3851,27 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
 	// read into a buffer
 	bufferlist bl;
+	bool async = false;
 	if (trimmed_read && op.extent.length == 0) {
 	  // read size was trimmed to zero and it is expected to do nothing
 	  // a read operation of 0 bytes does *not* do nothing, this is why
 	  // the trimmed_read boolean is needed
 	} else if (pool.info.require_rollback()) {
+	  async = true;
+	  boost::optional<uint32_t> maybe_crc;
+	  // If there is a data digest and it is possible we are reading
+	  // entire object, pass the digest.  FillInVerifyExtent will
+	  // will check the oi.size again.
+	  if (oi.is_data_digest() && op.extent.offset == 0 &&
+	      op.extent.length >= oi.size)
+	    maybe_crc = oi.data_digest;
 	  ctx->pending_async_reads.push_back(
 	    make_pair(
 	      boost::make_tuple(op.extent.offset, op.extent.length, op.flags),
-	      make_pair(&osd_op.outdata, new FillInExtent(&op.extent.length))));
+	      make_pair(&osd_op.outdata,
+			new FillInVerifyExtent(&op.extent.length, &osd_op.rval,
+				&osd_op.outdata, maybe_crc, oi.size, osd,
+				soid, op.flags))));
 	  dout(10) << " async_read noted for " << soid << dendl;
 	} else {
 	  int r = pgbackend->objects_read_sync(
@@ -3845,8 +3896,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 				 << " != expected 0x" << oi.data_digest
 				 << std::dec << " on " << soid;
 	      // FIXME fall back to replica or something?
-	      if (g_conf->osd_read_eio_on_bad_digest)
-		result = -EIO;
+	      result = -EIO;
 	    }
 	  }
 	}
@@ -3854,8 +3904,14 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  first_read = false;
 	  ctx->data_off = op.extent.offset;
 	}
+	// XXX the op.extent.length is the requested length for async read
+	// On error this length is changed to 0 after the error comes back.
 	ctx->delta_stats.num_rd_kb += SHIFT_ROUND_UP(op.extent.length, 10);
 	ctx->delta_stats.num_rd++;
+
+	// Skip checking the result and just proceed to the next operation
+	if (async)
+	  continue;
 
       }
       break;
@@ -3887,17 +3943,21 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
     /* map extents */
     case CEPH_OSD_OP_SPARSE_READ:
       tracepoint(osd, do_osd_op_pre_sparse_read, soid.oid.name.c_str(), soid.snap.val, oi.size, oi.truncate_seq, op.extent.offset, op.extent.length, op.extent.truncate_size, op.extent.truncate_seq);
-      if (pool.info.require_rollback()) {
-	result = -EOPNOTSUPP;
+      if (op.extent.truncate_seq) {
+	dout(0) << "sparse_read does not support truncation sequence " << dendl;
+	result = -EINVAL;
 	break;
       }
       ++ctx->num_read;
-      {
-        if (op.extent.truncate_seq) {
-          dout(0) << "sparse_read does not support truncation sequence " << dendl;
-          result = -EINVAL;
-          break;
-        }
+      if (pool.info.ec_pool()) {
+	// translate sparse read to a normal one if not supported
+	ctx->pending_async_reads.push_back(
+	  make_pair(
+	    boost::make_tuple(op.extent.offset, op.extent.length, op.flags),
+	    make_pair(&osd_op.outdata, new ToSparseReadResult(osd_op.outdata,
+							      op.extent.length))));
+	dout(10) << " async_read (was sparse_read) noted for " << soid << dendl;
+      } else {
 	// read into a buffer
 	bufferlist bl;
         int total_read = 0;
@@ -3964,11 +4024,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
         osd_op.outdata.claim_append(bl);
         ::encode_destructively(data_bl, osd_op.outdata);
 
-	ctx->delta_stats.num_rd_kb += SHIFT_ROUND_UP(op.extent.length, 10);
-	ctx->delta_stats.num_rd++;
-
 	dout(10) << " sparse_read got " << total_read << " bytes from object " << soid << dendl;
       }
+      ctx->delta_stats.num_rd_kb += SHIFT_ROUND_UP(op.extent.length, 10);
+      ctx->delta_stats.num_rd++;
       break;
 
     case CEPH_OSD_OP_CALL:
@@ -6274,6 +6333,10 @@ void ReplicatedPG::complete_read_ctx(int result, OpContext *ctx)
   assert(ctx->async_reads_complete());
 
   for (vector<OSDOp>::iterator p = ctx->ops.begin(); p != ctx->ops.end(); ++p) {
+    if (p->rval < 0 && !(p->op.flags & CEPH_OSD_OP_FLAG_FAILOK)) {
+      result = p->rval;
+      break;
+    }
     ctx->bytes_read += p->outdata.length();
   }
   ctx->reply->claim_op_out_data(ctx->ops);

@@ -258,6 +258,8 @@ int main(int argc, const char **argv)
   global_init(&def_args, args,
               CEPH_ENTITY_TYPE_MON, CODE_ENVIRONMENT_DAEMON, flags);
 
+  dout(0) << "Welcome to EonStor!" << dendl;
+
   uuid_d fsid;
   std::string val;
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ) {
